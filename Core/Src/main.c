@@ -22,9 +22,9 @@
 #include "cmsis_os.h"
 #include "gpio.h"
 #include "spi.h"
+#include "stm32f407xx.h"
 #include "tim.h"
 #include "usart.h"
-
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -171,14 +171,13 @@ void BuzzerTask(void *argument)
   vTaskDelete(NULL);                               // 删除自身，停止运行
 }
 
-/* ==================== 串口 Synex JustFloat 任务（独立区域） ==================== */
-
+/*串口*/
 #define JUSTFLOAT_TAIL 0x7F800000
 
-volatile float g_kp = 0.0f;        // 从串口接收到的 kp 值
-static uint8_t uart_rx_byte;       // 单字节接收缓冲
-static uint8_t uart_rx_buf[64];    // 行缓冲
-static uint16_t uart_rx_index = 0; // 行缓冲索引
+volatile float g_kp = 0.0f;
+static uint8_t uart_rx_byte;
+static uint8_t uart_rx_buf[64];
+static uint16_t uart_rx_index = 0;
 
 // 发送一个 JustFloat 帧（单通道）
 void Synex_SendFloat(float value)
@@ -190,7 +189,7 @@ void Synex_SendFloat(float value)
   HAL_UART_Transmit(&huart1, tx_buf, 8, 100);
 }
 
-// 串口接收中断回调（在 stm32f4xx_it.c 中调用）
+// 串口接收中断回调（只收数据，不做其他事）
 void Synex_RxCallback(UART_HandleTypeDef *huart)
 {
   if (huart->Instance == USART1)
@@ -202,9 +201,7 @@ void Synex_RxCallback(UART_HandleTypeDef *huart)
       {
         char *p = strstr((char *)uart_rx_buf, "kp=");
         if (p != NULL)
-        {
           g_kp = atof(p + 3);
-        }
       }
       uart_rx_index = 0;
       memset(uart_rx_buf, 0, 64);
@@ -216,21 +213,21 @@ void Synex_RxCallback(UART_HandleTypeDef *huart)
         uart_rx_buf[uart_rx_index++] = uart_rx_byte;
       }
     }
+    // 重新启动接收中断
     HAL_UART_Receive_IT(&huart1, &uart_rx_byte, 1);
   }
 }
 
-// 串口任务：周期性把 g_kp 用 JustFloat 发回 Synex
+// 串口发送任务（只发数据，不做其他事）
 void SynexTask(void *argument)
 {
-  vTaskDelay(pdMS_TO_TICKS(100));
+  vTaskDelay(pdMS_TO_TICKS(100)); // 等系统稳定
   for (;;)
   {
-    Synex_SendFloat(g_kp);
-    vTaskDelay(pdMS_TO_TICKS(10));
+    Synex_SendFloat(g_kp);         // 把 g_kp 发回 Synex
+    vTaskDelay(pdMS_TO_TICKS(10)); // 100Hz
   }
 }
-
 /* ==================== 串口代码结束 ==================== */
 /* USER CODE END 0 */
 
