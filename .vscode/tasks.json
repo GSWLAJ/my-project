@@ -1,0 +1,36 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "STM32: OpenOCD: Flash project (DAPLink)",
+      "type": "process",
+      "command": "D:\\openOCD\\bin\\openocd.exe",
+      "args": [
+        "-s",
+        "D:\\openOCD\\share\\openocd\\scripts",
+        "-f",
+        "interface/stlink.cfg",
+        "-c",
+        "transport select hla_swd",
+        "-c",
+        "adapter speed 2000",
+        "-f",
+        "target/stm32f4x.cfg",
+        "-c",
+        "program {${command:cmake.buildDirectory}/GSWLAJ.elf} verify reset exit"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": [],
+      "presentation": {
+        "echo": true,
+        "reveal": "always",
+        "focus": false,
+        "panel": "dedicated",
+        "clear": true,
+        "showReuseMessage": true
+      }
+    }
+  ]
+}

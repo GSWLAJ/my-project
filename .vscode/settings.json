@@ -1,0 +1,20 @@
+{
+  "cmake.cmakePath": "cube-cmake",
+  "cmake.configureArgs": ["-DCMAKE_COMMAND=cube-cmake"],
+  "cmake.preferredGenerators": ["Ninja"],
+  "stm32cube-ide-clangd.path": "cube",
+  "stm32cube-ide-clangd.arguments": [
+    "starm-clangd",
+    "--query-driver=${env:CUBE_BUNDLE_PATH}/st-arm-clang/21.1.1+st.7/bin/starm-clang*",
+    "--query-driver=${env:CUBE_BUNDLE_PATH}/st-arm-clang/21.1.1+st.7/bin/starm-clang++*"
+  ],
+  "VsCodeTaskButtons.showCounter": false,
+  "VsCodeTaskButtons.tasks": [
+    {
+      "label": "$(cloud-download) DAPLink 烧录",
+      "task": "STM32: OpenOCD: Flash project (DAPLink)",
+      "alignment": "left",
+      "tooltip": "使用 DAPLink + OpenOCD 烧录当前 CMake 预设的固件并复位"
+    }
+  ]
+}
