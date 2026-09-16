@@ -22,7 +22,6 @@
 #include "cmsis_os.h"
 #include "gpio.h"
 #include "spi.h"
-#include "stm32f407xx.h"
 #include "tim.h"
 #include "usart.h"
 
@@ -30,6 +29,7 @@
 /* USER CODE BEGIN Includes */
 #include "FreeRTOS.h"
 #include "task.h"
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -229,6 +229,144 @@ void SynexTask(void *argument)
   }
 }
 /* ==================== 串口代码结束 ==================== */
+
+/* ==================== 第五部分：M3508 电机控制 ==================== */
+typedef struct
+{
+  uint16_t ecd;
+  int16_t speed_rpm;
+  int16_t given_current;
+  uint8_t temperature;
+  uint16_t last_ecd;
+  int32_t round_cnt;
+  int32_t total_ecd;
+  float real_angle;
+} Motor_Measure_t;
+
+Motor_Measure_t motor1 = {0};
+
+typedef struct
+{
+  float Kp, Ki, Kd;
+  float integral, prev_error;
+  float output;
+  float out_max;
+} PID_Controller;
+
+PID_Controller angle_pid = {1.0f, 0.0f, 0.1f, 0, 0, 0, 8000.0f};
+PID_Controller speed_pid = {10.0f, 0.5f, 0.0f, 0, 0, 0, 16000.0f};
+
+float PID_Calc(PID_Controller *pid, float target, float measured)
+{
+  float error = target - measured;
+  pid->integral += error;
+  if (pid->integral > pid->out_max)
+    pid->integral = pid->out_max;
+  if (pid->integral < -pid->out_max)
+    pid->integral = -pid->out_max;
+  float derivative = error - pid->prev_error;
+  pid->prev_error = error;
+  float output = pid->Kp * error + pid->Ki * pid->integral + pid->Kd * derivative;
+  if (output > pid->out_max)
+    output = pid->out_max;
+  if (output < -pid->out_max)
+    output = -pid->out_max;
+  return output;
+}
+
+void CAN_Send_Current(CAN_HandleTypeDef *hcan, int16_t m1, int16_t m2, int16_t m3, int16_t m4)
+{
+  CAN_TxHeaderTypeDef tx_header;
+  uint8_t tx_data[8];
+  uint32_t tx_mailbox;
+  tx_header.StdId = 0x200;
+  tx_header.IDE = CAN_ID_STD;
+  tx_header.RTR = CAN_RTR_DATA;
+  tx_header.DLC = 8;
+  tx_data[0] = (uint8_t)(m1 >> 8);
+  tx_data[1] = (uint8_t)(m1 & 0xFF);
+  tx_data[2] = (uint8_t)(m2 >> 8);
+  tx_data[3] = (uint8_t)(m2 & 0xFF);
+  tx_data[4] = (uint8_t)(m3 >> 8);
+  tx_data[5] = (uint8_t)(m3 & 0xFF);
+  tx_data[6] = (uint8_t)(m4 >> 8);
+  tx_data[7] = (uint8_t)(m4 & 0xFF);
+  HAL_CAN_AddTxMessage(hcan, &tx_header, tx_data, &tx_mailbox);
+}
+
+void Motor_CAN_RxCallback(CAN_HandleTypeDef *hcan)
+{
+  CAN_RxHeaderTypeDef rx_header;
+  uint8_t rx_data[8];
+  if (HAL_CAN_GetRxMessage(hcan, CAN_RX_FIFO0, &rx_header, rx_data) != HAL_OK)
+    return;
+
+  if (rx_header.StdId == 0x201)
+  {
+    // 收到电调反馈，LED翻转指示
+    HAL_GPIO_TogglePin(GPIOH, GPIO_PIN_13);
+
+    motor1.last_ecd = motor1.ecd;
+    motor1.ecd = (uint16_t)(rx_data[0] << 8 | rx_data[1]);
+    motor1.speed_rpm = (int16_t)(rx_data[2] << 8 | rx_data[3]);
+    motor1.given_current = (int16_t)(rx_data[4] << 8 | rx_data[5]);
+    motor1.temperature = rx_data[6];
+
+    if (motor1.ecd - motor1.last_ecd > 4096)
+      motor1.round_cnt--;
+    else if (motor1.ecd - motor1.last_ecd < -4096)
+      motor1.round_cnt++;
+    motor1.total_ecd = motor1.ecd + motor1.round_cnt * 8192;
+    motor1.real_angle = (float)motor1.total_ecd * (360.0f / 8192.0f);
+  }
+}
+
+// 任务5：角度闭环控制
+void AngleControlTask(void *argument)
+{
+  vTaskDelay(pdMS_TO_TICKS(100));
+  float start_angle = motor1.real_angle;
+  float target_seq[3] = {0.0f, 90.0f, -90.0f};
+  uint8_t seq_index = 0;
+  uint32_t last_time = xTaskGetTickCount();
+
+  for (;;)
+  {
+    angle_pid.Kp = g_kp;
+
+    float target = start_angle + target_seq[seq_index];
+    float angle_output = PID_Calc(&angle_pid, target, motor1.real_angle);
+    float speed_feedback = (float)motor1.speed_rpm * (8192.0f / 60.0f);
+    float speed_output = PID_Calc(&speed_pid, angle_output, speed_feedback);
+
+    int16_t current_cmd = (int16_t)speed_output;
+    if (current_cmd > 16384)
+      current_cmd = 16384;
+    if (current_cmd < -16384)
+      current_cmd = -16384;
+    CAN_Send_Current(&hcan1, current_cmd, 0, 0, 0);
+
+    if ((xTaskGetTickCount() - last_time) >= pdMS_TO_TICKS(2000))
+    {
+      last_time = xTaskGetTickCount();
+      seq_index = (seq_index + 1) % 3;
+    }
+    vTaskDelay(pdMS_TO_TICKS(1));
+  }
+}
+
+// 任务6：Synex 打印电机数据
+void MotorDataTask(void *argument)
+{
+  vTaskDelay(pdMS_TO_TICKS(100));
+  for (;;)
+  {
+    Synex_SendFloat((float)motor1.given_current);
+    Synex_SendFloat(motor1.real_angle);
+    Synex_SendFloat((float)motor1.speed_rpm);
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
+}
 /* USER CODE END 0 */
 
 /**
@@ -271,9 +409,12 @@ int main(void)
   HAL_TIM_PWM_Start(&htim5, TIM_CHANNEL_2); // PH11 绿
   HAL_TIM_PWM_Start(&htim5, TIM_CHANNEL_1); // PH10 蓝
   HAL_TIM_PWM_Start(&htim4, TIM_CHANNEL_3);
-
   // 串口接收初始化（启动串口1接收中断）
   HAL_UART_Receive_IT(&huart1, &uart_rx_byte, 1);
+  // CAN1 启动
+  HAL_CAN_Start(&hcan1);
+  HAL_CAN_ActivateNotification(&hcan1, CAN_IT_RX_FIFO0_MSG_PENDING);
+
   // 创建任务（CMSIS_V2）
   osThreadNew(LedFlowTask, NULL, NULL);
   osThreadNew(WS2812Task, NULL, NULL);
@@ -281,6 +422,9 @@ int main(void)
 
   // 新增串口任务
   osThreadNew(SynexTask, NULL, NULL);
+  // 电机任务
+  osThreadNew(AngleControlTask, NULL, NULL);
+  osThreadNew(MotorDataTask, NULL, NULL);
   /* USER CODE END 2 */
 
   /* Init scheduler */
