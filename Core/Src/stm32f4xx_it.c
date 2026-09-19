@@ -205,14 +205,13 @@ void USART1_IRQHandler(void)
 }
 
 /* USER CODE BEGIN 1 */
-extern void Motor_CAN_RxCallback(CAN_HandleTypeDef *hcan);
+/*extern void Motor_CAN_RxCallback(CAN_HandleTypeDef *hcan);
 void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan)
 {
   Motor_CAN_RxCallback(hcan);
 }
-
+*/
 extern void Synex_RxCallback(UART_HandleTypeDef *huart);
-
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {
   Synex_RxCallback(huart);
