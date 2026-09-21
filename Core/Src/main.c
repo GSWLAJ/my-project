@@ -58,7 +58,6 @@ uint8_t rx_byte;                // 接收单字节
 char rx_buffer[RX_BUFFER_SIZE]; // 接收字符串缓冲区
 uint8_t rx_index = 0;           // 缓冲区索引
 uint8_t rx_complete_flag = 0;   // 接收完成标志
-float g_kp = 0.0f;              // 解析出的 kp 值
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -176,59 +175,110 @@ void BuzzerTask(void *argument)
   __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_3, 0); // 确保 PWM 占空比为0
   vTaskDelete(NULL);                               // 删除自身，停止运行
 }
-// 串口//
-/**
- * @brief  使用 JustFloat 协议发送一个浮点数（一个通道）
- * @param  value: 要发送的浮点数
- *
- * 协议格式：[float32 小端 4字节] + [帧尾 00 00 80 7F]
- * 帧尾 0x7F800000 是 JustFloat 协议规定的固定值
- */
-void Synex_SendFloat(float value)
+/* ==================== 串口环形缓冲 ==================== */
+#define UART1_RX_RING_SIZE 128
+static uint8_t g_uart1_ring[UART1_RX_RING_SIZE];
+static volatile uint16_t g_uart1_head = 0;
+static volatile uint16_t g_uart1_tail = 0;
+static uint8_t g_uart1_rx_byte = 0;
+
+/* 互斥锁 */
+osMutexId_t uart1_tx_mutex;
+
+/* ==================== JustFloat 发送 ==================== */
+void Synex_UploadJustFloat(float data)
 {
-  uint8_t tx_buffer[8];
-  const uint8_t tail[4] = {0x00, 0x00, 0x80, 0x7f}; // JustFloat 帧尾
+  float frame[2];
+  frame[0] = data;
+  const uint32_t tail = 0x7F800000u;
+  memcpy(&frame[1], &tail, sizeof(tail));
 
-  // 将 float 的 4 字节拷贝到发送缓冲区
-  // STM32 是小端模式，直接 memcpy 即可，无需手动调换字节
-  memcpy(tx_buffer, &value, 4);
-  // 拷贝帧尾
-  memcpy(tx_buffer + 4, tail, 4);
-
-  // 通过串口发送 8 个字节
-  // 注意：huart1 需根据你实际使用的串口修改
-  HAL_UART_Transmit(&huart1, tx_buffer, 8, 100);
+  osMutexAcquire(uart1_tx_mutex, osWaitForever);
+  HAL_UART_Transmit(&huart1, (uint8_t *)frame, 8, 100);
+  osMutexRelease(uart1_tx_mutex);
 }
 
-/**
- * @brief  FreeRTOS 任务：处理串口收到的命令
- * @param  argument: 任务参数（未使用）
- */
-void SynexTask(void *argument)
+void Synex_UploadJustFloat3(float *data)
 {
-  // 启动串口中断接收，接收 1 个字节到 rx_byte
-  HAL_UART_Receive_IT(&huart1, &rx_byte, 1);
+  float frame[4];
+  frame[0] = data[0];
+  frame[1] = data[1];
+  frame[2] = data[2];
+  const uint32_t tail = 0x7F800000u;
+  memcpy(&frame[3], &tail, sizeof(tail));
 
-  for (;;)
+  osMutexAcquire(uart1_tx_mutex, osWaitForever);
+  HAL_UART_Transmit(&huart1, (uint8_t *)frame, 16, 100);
+  osMutexRelease(uart1_tx_mutex);
+}
+
+/* ==================== 中断回调：只塞环形缓冲 ==================== */
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+  if (huart->Instance == USART1)
   {
-    if (rx_complete_flag)
+    uint16_t next = (g_uart1_head + 1) % UART1_RX_RING_SIZE;
+    if (next != g_uart1_tail)
     {
-      rx_complete_flag = 0;
-
-      float kp_value = 0.0f;
-      // 解析 "kp=%.3f" 格式
-      if (sscanf(rx_buffer, "kp=%f", &kp_value) == 1)
-      {
-        g_kp = kp_value;           // 更新全局 kp 变量
-        Synex_SendFloat(kp_value); // 用 JustFloat 协议发回给 synex
-      }
-      memset(rx_buffer, 0, RX_BUFFER_SIZE);
+      g_uart1_ring[g_uart1_head] = g_uart1_rx_byte;
+      g_uart1_head = next;
     }
-    vTaskDelay(pdMS_TO_TICKS(10)); // 10ms 轮询一次
+    HAL_UART_Receive_IT(&huart1, &g_uart1_rx_byte, 1);
   }
 }
 
-/* ==================== 第五部分：M3508 电机控制 ==================== */
+/* ==================== 解析任务 ==================== */
+volatile float g_kp = 0.0f;
+
+void UartParseTask(void *argument)
+{
+  vTaskDelay(pdMS_TO_TICKS(100));
+  uint8_t buf[64];
+  uint16_t idx = 0;
+
+  for (;;)
+  {
+    while (g_uart1_tail != g_uart1_head)
+    {
+      uint8_t b = g_uart1_ring[g_uart1_tail];
+      g_uart1_tail = (g_uart1_tail + 1) % UART1_RX_RING_SIZE;
+
+      if (b == '\r' || b == '\n')
+      {
+        buf[idx] = '\0';
+        if (idx > 0)
+        {
+          char *p = strstr((char *)buf, "kp=");
+          if (p != NULL)
+          {
+            g_kp = atof(p + 3);
+            Synex_UploadJustFloat(g_kp); // 收到立刻发回
+          }
+        }
+        idx = 0;
+        memset(buf, 0, 64);
+      }
+      else
+      {
+        if (idx < 63)
+          buf[idx++] = b;
+      }
+    }
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
+}
+
+/* ==================== 周期性发送任务 ==================== */
+void SynexTask(void *argument)
+{
+  vTaskDelay(pdMS_TO_TICKS(100));
+  for (;;)
+  {
+    Synex_UploadJustFloat(g_kp);
+    vTaskDelay(pdMS_TO_TICKS(100));
+  }
+}
+/* ==================== M3508 电机控制 ==================== */
 typedef struct
 {
   uint16_t ecd;
@@ -247,12 +297,11 @@ typedef struct
 {
   float Kp, Ki, Kd;
   float integral, prev_error;
-  float output;
   float out_max;
 } PID_Controller;
 
-PID_Controller angle_pid = {1.0f, 0.0f, 0.1f, 0, 0, 0, 8000.0f};
-PID_Controller speed_pid = {10.0f, 0.5f, 0.0f, 0, 0, 0, 16000.0f};
+PID_Controller angle_pid = {1.0f, 0.0f, 0.1f, 0, 0, 8000.0f};
+PID_Controller speed_pid = {10.0f, 0.5f, 0.0f, 0, 0, 16000.0f};
 
 float PID_Calc(PID_Controller *pid, float target, float measured)
 {
@@ -298,18 +347,13 @@ void Motor_CAN_RxCallback(CAN_HandleTypeDef *hcan)
   uint8_t rx_data[8];
   if (HAL_CAN_GetRxMessage(hcan, CAN_RX_FIFO0, &rx_header, rx_data) != HAL_OK)
     return;
-
   if (rx_header.StdId == 0x201)
-  {
-    // 收到电调反馈，LED翻转指示
-    HAL_GPIO_TogglePin(GPIOH, GPIO_PIN_13);
-
+  { // 电机 ID = 1
     motor1.last_ecd = motor1.ecd;
     motor1.ecd = (uint16_t)(rx_data[0] << 8 | rx_data[1]);
     motor1.speed_rpm = (int16_t)(rx_data[2] << 8 | rx_data[3]);
     motor1.given_current = (int16_t)(rx_data[4] << 8 | rx_data[5]);
     motor1.temperature = rx_data[6];
-
     if (motor1.ecd - motor1.last_ecd > 4096)
       motor1.round_cnt--;
     else if (motor1.ecd - motor1.last_ecd < -4096)
@@ -319,7 +363,7 @@ void Motor_CAN_RxCallback(CAN_HandleTypeDef *hcan)
   }
 }
 
-// 任务5：角度闭环控制
+// 任务5：角度闭环控制（2 秒从 0° -> 90° -> -90°）
 void AngleControlTask(void *argument)
 {
   vTaskDelay(pdMS_TO_TICKS(100));
@@ -353,15 +397,17 @@ void AngleControlTask(void *argument)
   }
 }
 
-// 任务6：Synex 打印电机数据
+// 任务6：Synex 打印电机数据（电流 / 角度 / 转速）
 void MotorDataTask(void *argument)
 {
   vTaskDelay(pdMS_TO_TICKS(100));
+  float data[3];
   for (;;)
   {
-    Synex_SendFloat((float)motor1.given_current);
-    Synex_SendFloat(motor1.real_angle);
-    Synex_SendFloat((float)motor1.speed_rpm);
+    data[0] = (float)motor1.given_current;
+    data[1] = motor1.real_angle;
+    data[2] = (float)motor1.speed_rpm;
+    Synex_UploadJustFloat3(data);
     vTaskDelay(pdMS_TO_TICKS(10));
   }
 }
@@ -403,31 +449,27 @@ int main(void)
   MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
   // 启动TIM5的三路PWM
-  /*HAL_TIM_PWM_Start(&htim5, TIM_CHANNEL_3); // PH12 红
+  HAL_TIM_PWM_Start(&htim5, TIM_CHANNEL_3); // PH12 红
   HAL_TIM_PWM_Start(&htim5, TIM_CHANNEL_2); // PH11 绿
   HAL_TIM_PWM_Start(&htim5, TIM_CHANNEL_1); // PH10 蓝
-  HAL_TIM_PWM_Start(&htim4, TIM_CHANNEL_3);*/
+  HAL_TIM_PWM_Start(&htim4, TIM_CHANNEL_3);
+  // 创建互斥锁
+  uart1_tx_mutex = osMutexNew(NULL);
   // 串口接收初始化（启动串口1接收中断）
-  HAL_UART_Receive_IT(&huart1, &rx_byte, 1);
+  HAL_UART_Receive_IT(&huart1, &g_uart1_rx_byte, 1);
   // CAN1 启动
-  /*HAL_CAN_Start(&hcan1);
+  HAL_CAN_Start(&hcan1);
   HAL_CAN_ActivateNotification(&hcan1, CAN_IT_RX_FIFO0_MSG_PENDING);
-*/
+
   // 创建任务（CMSIS_V2）
   /*osThreadNew(LedFlowTask, NULL, NULL);
   osThreadNew(WS2812Task, NULL, NULL);
-  osThreadNew(BuzzerTask, NULL, NULL);
-*/
+  osThreadNew(BuzzerTask, NULL, NULL);*/
   // 新增串口任务
-  const osThreadAttr_t synexTask_attributes = {
-      .name = "SynexTask",
-      .stack_size = 512 * 4,
-      .priority = (osPriority_t)osPriorityNormal,
-  };
-  osThreadNew(SynexTask, NULL, &synexTask_attributes);
-  // 电机任务
-  /* osThreadNew(AngleControlTask, NULL, NULL);
-   osThreadNew(MotorDataTask, NULL, NULL);*/
+  osThreadNew(UartParseTask, NULL, NULL);
+  osThreadNew(SynexTask, NULL, NULL);        // 串口 JustFloat（任务四）
+  osThreadNew(AngleControlTask, NULL, NULL); // 角度闭环（任务五）
+  osThreadNew(MotorDataTask, NULL, NULL);    // 电机数据打印（任务五）
   /* USER CODE END 2 */
 
   /* Init scheduler */
@@ -496,38 +538,7 @@ void SystemClock_Config(void)
 }
 
 /* USER CODE BEGIN 4 */
-/**
- * @brief  串口接收完成回调函数
- * @param  huart: 串口句柄
- */
-void Synex_RxCallback(UART_HandleTypeDef *huart)
-{
-  if (huart->Instance == USART1) // 根据实际串口修改
-  {
-    // 接收到回车符 '\r'，表示一帧结束
-    if (rx_byte == '\r')
-    {
-      rx_buffer[rx_index] = '\0'; // 字符串结尾加上 \0
-      rx_complete_flag = 1;       // 置位完成标志
-      rx_index = 0;               // 重置索引
-    }
-    else
-    {
-      // 普通字符，存入缓冲区
-      if (rx_index < RX_BUFFER_SIZE - 1)
-      {
-        rx_buffer[rx_index++] = rx_byte;
-      }
-      else
-      {
-        rx_index = 0; // 缓冲区溢出保护
-      }
-    }
 
-    // 重新启动接收中断，准备接收下一个字节
-    HAL_UART_Receive_IT(&huart1, &rx_byte, 1);
-  }
-}
 /* USER CODE END 4 */
 
 /**
